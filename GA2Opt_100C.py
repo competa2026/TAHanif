@@ -407,7 +407,7 @@ if __name__ == "__main__":
     ]
 
     NUM_CUSTOMERS = 100
-    N_REPETITIONS = 5      # DIKEMBALIKAN KE 5 REPETISI
+    N_REPETITIONS = 10     # Jumlah ulangan per dataset
 
     P_2OPT_BEST = 0.3
     PM_BEST = 0.5
@@ -417,10 +417,10 @@ if __name__ == "__main__":
 
     print("=" * 135)
     print(f"FINAL RUN UJI STABILITAS: HYBRID GA + 2-OPT ({NUM_CUSTOMERS} PELANGGAN)")
-    print(f"Menggunakan Full Matrix Parallelism (50 Tugas Sekaligus - 5x Repetisi)")
+    print(f"Menggunakan Full Matrix Parallelism (100 Tugas Sekaligus - 10x Repetisi)")
     print("=" * 135)
 
-    # 1. Kumpulkan semua 50 Tasks (10 Dataset x 5 Repetisi)
+    # 1. Kumpulkan semua 100 Tasks (10 Dataset x 10 Repetisi)
     all_tasks = []
     for file_name in daftar_instance:
         if not os.path.exists(file_name):
@@ -432,7 +432,7 @@ if __name__ == "__main__":
         for run_ke in range(1, N_REPETITIONS + 1):
             all_tasks.append((file_name, NUM_CUSTOMERS, run_ke, POP_SIZE, MAX_GEN, PM_BEST, ELITISM_BEST, P_2OPT_BEST))
 
-    # 2. Lempar ke-50 Tasks ke ProcessPoolExecutor sekaligus
+    # 2. Lempar ke-100 Tasks ke ProcessPoolExecutor sekaligus
     results_all = []
     print(f"[SYSTEM] Memulai eksekusi {len(all_tasks)} tugas secara paralel. Mohon tunggu...\n")
 
@@ -506,6 +506,6 @@ if __name__ == "__main__":
         print("=" * 135)
 
         # Simpan ke CSV
-        nama_file = "FinalRun_HybridGA_2Opt_100Cust_5Reps.csv"
+        nama_file = "FinalRun_HybridGA_2Opt_100Cust_10Reps.csv"
         df_stabilitas.to_csv(nama_file, index=False)
         print(f"\n[SUKSES] Data stabilitas berhasil disimpan ke: '{nama_file}'")
