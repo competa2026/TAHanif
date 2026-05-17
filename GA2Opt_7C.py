@@ -5,14 +5,15 @@ VALIDASI METAHEURISTIK: Hybrid GA + 2-Opt (7 Pelanggan)
 TA: Hanif Hisyam Ramadhan (2026) - ITS Surabaya
 Pembimbing: Prof. Budi Santosa, Ph.D.
 
-Keterangan:
-File ini dirancang untuk memvalidasi algoritma Hybrid GA + 2-Opt
-melawan hasil eksak MILP CBC. Pengujian dilakukan pada 7 pelanggan
-pertama dari 10 Dataset Solomon. Format output disamakan dengan CBC.
+Versi 10-repetisi paralel: setiap dataset dijalankan N_REPETITIONS
+kali secara paralel (ProcessPoolExecutor). Ringkasan stabilitas
+dicetak dengan kolom: Best_Z, Rata2_Biaya_Z, Rata2_Truk,
+Rata2_Waktu, Total_Valid, ARPD (%), Alasan_Mayoritas_Gagal.
 
-Versi ini di-JIT dengan Numba: evaluator dan 2-Opt dijalankan di
-native code. Algoritma, probabilitas, model penalti (1x Big-M utk
-telat ATAU busuk), perhitungan jarak, dan parameter TIDAK diubah.
+Numba JIT pada evaluator + 2-Opt. Model penalti dipertahankan:
+SATU big_M jika (telat ATAU busuk) - identik dengan kode asli.
+Bitflag pelanggaran dilacak terpisah hanya untuk pelaporan
+"alasan", tidak mempengaruhi nilai penalti maupun Z.
 ============================================================
 """
 
@@ -22,14 +23,14 @@ import pandas as pd
 import random
 import time
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from numba import njit
 
 # ---------------------------------------------------------
 # JIT-COMPILED CORE: EVALUATOR + 2-OPT
-# Catatan model penalti versi 7C: satu big_M jika telat ATAU
-# busuk (bukan dua big_M terpisah). Output juga membawa buffer
-# trip layout (trip_flat + trip_starts) agar routes_record
-# bisa direkonstruksi di Python wrapper.
+# Model penalti 7C: 1x big_M jika (telat OR busuk).
+# viol_flags hanya untuk pelaporan (tidak mengubah penalti/Z).
+# Buffer trip_flat + trip_starts untuk routes_record.
 # ---------------------------------------------------------
 @njit(cache=True, fastmath=False)
 def _calc_cost_jit(chrom,
@@ -39,7 +40,6 @@ def _calc_cost_jit(chrom,
                    fish_price, q_min, alpha_arc, alpha_node):
     n_chrom = chrom.shape[0]
 
-    # Buffer trip layout: customers tanpa depot 0; trip_starts indeks
     trip_flat   = np.empty(n_chrom, dtype=np.int64)
     trip_starts = np.empty(n_chrom + 2, dtype=np.int64)
     trip_flat_len = 0
@@ -55,6 +55,9 @@ def _calc_cost_jit(chrom,
     total_distance  = 0.0
     quality_penalty_cost = 0.0
     penalty_violation    = 0.0
+
+    # Bitflag pelaporan: 1=Telat Waktu, 2=Ikan Busuk, 4=Over Armada
+    viol_flags = 0
 
     for k in range(n_chrom):
         cust_id = chrom[k]
@@ -105,9 +108,14 @@ def _calc_cost_jit(chrom,
             service_start = arrival_time + w2
             tentative_quality = math.exp(-(alpha_arc * t_0j))
 
-        # Penalti versi 7C: SATU big_M jika telat ATAU busuk
+        # Penalti versi 7C: SATU big_M jika telat ATAU busuk.
+        # Bitflag dilacak terpisah (tidak mempengaruhi penalti).
         if (service_start > cust_due) or (tentative_quality < q_min):
             penalty_violation += big_M
+            if service_start > cust_due:
+                viol_flags |= 1
+            if tentative_quality < q_min:
+                viol_flags |= 2
 
         current_load   += cust_demand
         current_time    = service_start + cust_svc
@@ -121,19 +129,20 @@ def _calc_cost_jit(chrom,
         trip_flat_len += 1
 
     total_distance += distance_matrix[current_node, 0]
-    trip_starts[n_trips] = trip_flat_len  # tutup trip terakhir
+    trip_starts[n_trips] = trip_flat_len
 
     c1_cost = vehicles_used * fixed_cost
     c2_cost = total_distance * var_cost
 
     if vehicles_used > max_veh:
         penalty_violation += big_M * (vehicles_used - max_veh)
+        viol_flags |= 4
 
     real_z      = c1_cost + c2_cost + quality_penalty_cost
     penalized_z = real_z + penalty_violation
     fitness     = 1.0 / (1.0 + penalized_z)
 
-    # Salin ke array berukuran eksak agar tuple return aman di Numba
+    # Salin ke array berukuran eksak
     out_trip_flat = np.empty(trip_flat_len, dtype=np.int64)
     for i in range(trip_flat_len):
         out_trip_flat[i] = trip_flat[i]
@@ -143,7 +152,7 @@ def _calc_cost_jit(chrom,
 
     return (real_z, penalized_z, fitness, vehicles_used,
             c1_cost, c2_cost, quality_penalty_cost, penalty_violation,
-            out_trip_flat, out_trip_starts)
+            out_trip_flat, out_trip_starts, viol_flags)
 
 
 @njit(cache=True, fastmath=False)
@@ -152,7 +161,6 @@ def _apply_2opt_jit(chrom,
                     distance_matrix, time_matrix,
                     Q_k, max_veh, fixed_cost, var_cost, big_M, t_max,
                     fish_price, q_min, alpha_arc, alpha_node):
-    # In-place 2-opt, first-improvement. O(1) extra space (selain buffer trip dari evaluator).
     best_route = chrom.copy()
     res = _calc_cost_jit(best_route, demands, ready_times, due_dates, service_times,
                          distance_matrix, time_matrix,
@@ -233,7 +241,6 @@ class VRPEnvironment:
         self._calculate_matrices()
 
     def _calculate_alpha(self, temperature):
-        # Konversi per jam menjadi per menit (dibagi 60.0)
         return (self.alpha_0 * math.exp(self.theta * temperature)) / 60.0
 
     def _load_solomon_data(self):
@@ -266,7 +273,7 @@ class VRPEnvironment:
                     row['READY_TIME'], row['DUE_DATE'], row['SERVICE_TIME']
                 ))
         except Exception as e:
-            pass # Akan ditangani di blok eksekusi utama
+            pass
 
     def _calculate_matrices(self):
         n = len(self.nodes)
@@ -284,7 +291,8 @@ class VRPEnvironment:
 
 # ---------------------------------------------------------
 # BAGIAN 2: EVALUATOR (THIN WRAPPER ATAS JIT)
-# Mempertahankan signature 9-tuple original (routes_record).
+# Return 10-tuple: (real_z, pz, fit, veh, c1, c2, qpc, pv,
+#                   routes_record, alasan_str)
 # ---------------------------------------------------------
 class RouteEvaluator:
     def __init__(self, env, var_cost):
@@ -296,7 +304,6 @@ class RouteEvaluator:
         self.big_M = 1e9
         self.t_max = float(env.get_depot().due_date)
 
-        # SoA: ekstrak field Customer ke numpy arrays sekali
         self.demands       = np.array([c.demand for c in env.nodes],       dtype=np.float64)
         self.ready_times   = np.array([c.ready_time for c in env.nodes],   dtype=np.float64)
         self.due_dates     = np.array([c.due_date for c in env.nodes],     dtype=np.float64)
@@ -318,15 +325,13 @@ class RouteEvaluator:
         chrom_arr = self._to_arr(chromosome)
         (real_z, penalized_z, fitness, vehicles_used,
          c1_cost, c2_cost, qpc, pv,
-         trip_flat, trip_starts) = _calc_cost_jit(
+         trip_flat, trip_starts, viol_flags) = _calc_cost_jit(
             chrom_arr,
             self.demands, self.ready_times, self.due_dates, self.service_times,
             self.distance_matrix, self.time_matrix,
             self.Q_k, self.max_veh, self.fixed_cost, self.var_cost, self.big_M, self.t_max,
             self.fish_price, self.q_min, self.alpha_arc, self.alpha_node)
 
-        # Rekonstruksi routes_record persis seperti versi original:
-        # tiap trip = [0, ...customers..., 0]
         routes_record = []
         n_trips = len(trip_starts) - 1
         for k in range(n_trips):
@@ -335,8 +340,14 @@ class RouteEvaluator:
             trip = [0] + [int(x) for x in trip_flat[start:end]] + [0]
             routes_record.append(trip)
 
+        labels = []
+        if viol_flags & 1: labels.append("Telat Waktu")
+        if viol_flags & 2: labels.append("Ikan Busuk (<80%)")
+        if viol_flags & 4: labels.append("Over Armada")
+        alasan_str = ", ".join(labels) if labels else "Valid"
+
         return (real_z, penalized_z, fitness, int(vehicles_used),
-                c1_cost, c2_cost, qpc, pv, routes_record)
+                c1_cost, c2_cost, qpc, pv, routes_record, alasan_str)
 
     def apply_2opt_arr(self, chromosome):
         chrom_arr = self._to_arr(chromosome)
@@ -392,7 +403,6 @@ class HybridGA:
             sorted_indices = np.argsort(pop_fitnesses)[::-1]
             new_population = []
 
-            # Elitism dengan 100% 2-Opt
             for i in sorted_indices[:self.num_elites]:
                 elite_chrom = population[i].copy()
                 optimized_elite = self.apply_2opt(elite_chrom)
@@ -411,7 +421,6 @@ class HybridGA:
 
                 offspring = parent.copy()
 
-                # Mutasi
                 if random.random() < self.p_m:
                     if random.random() < 0.5:
                         idx = random.randint(0, len(offspring)-1)
@@ -421,7 +430,6 @@ class HybridGA:
                         idx1, idx2 = random.sample(range(len(offspring)), 2)
                         offspring[idx1], offspring[idx2] = offspring[idx2], offspring[idx1]
 
-                # Probabilistic 2-Opt
                 if random.random() < self.p_2opt:
                     offspring = self.apply_2opt(offspring)
 
@@ -430,8 +438,34 @@ class HybridGA:
 
         return best_route_chrom, best_details
 
+
 # ---------------------------------------------------------
-# BAGIAN 4: EKSEKUSI UTAMA (10 DATASET)
+# WORKER UNTUK MULTIPROCESSING
+# ---------------------------------------------------------
+def single_run_worker(args):
+    file_name, run_ke, num_customers, pop_size, max_gen, p_m, elitism, p_2opt, var_cost = args
+
+    random.seed(run_ke * 1000 + int(time.time() * 1000) % 100000)
+    np.random.seed(run_ke * 1000 + int(time.time() * 1000) % 100000)
+
+    env = VRPEnvironment(file_path=file_name, num_customers=num_customers)
+    if len(env.nodes) == 0:
+        return run_ke, None, None, 0.0
+
+    evaluator = RouteEvaluator(env, var_cost=var_cost)
+    solver = HybridGA(env, evaluator,
+                      pop_size=pop_size, max_gen=max_gen,
+                      p_m=p_m, elitism_rate=elitism, p_2opt=p_2opt)
+
+    t_start = time.time()
+    best_route_chrom, best_details = solver.run()
+    t_end = time.time()
+
+    return run_ke, best_route_chrom, best_details, round(t_end - t_start, 3)
+
+
+# ---------------------------------------------------------
+# BAGIAN 4: EKSEKUSI UTAMA (10 DATASET x 10 REPETISI PARALEL)
 # ---------------------------------------------------------
 if __name__ == "__main__":
 
@@ -441,108 +475,141 @@ if __name__ == "__main__":
     ]
 
     NUM_CUSTOMERS = 7
-    # Parameter terbaik diasumsikan:
-    PM = 0.1
-    ELITISM = 0.20
-    P_2OPT = 0.3
+    N_REPETITIONS = 10
+    VAR_COST = 10000
+
+    PM       = 0.1
+    ELITISM  = 0.20
+    P_2OPT   = 0.3
     POP_SIZE = 100
-    MAX_GEN = 100
+    MAX_GEN  = 100
+
+    N_WORKERS = os.cpu_count()
 
     # KUNCI JAWABAN (Best Known Solution) DARI HASIL EKSAK CBC
     BKS_EXACT = {
-        "R101": 2472852.53,
-        "R111": 1958069.39,
-        "C101": 2715870.13,
-        "C105": 2715870.13,
-        "RC101": 2218959.69,
-        "RC105": 2224621.52,
-        "R201": 2987039.12,
-        "C201": 4163402.66,
-        "RC201": 3018959.69,
+        "R101": 2472852.53, "R111": 1958069.39, "C101": 2715870.13,
+        "C105": 2715870.13, "RC101": 2218959.69, "RC105": 2224621.52,
+        "R201": 2987039.12, "C201": 4163402.66, "RC201": 3018959.69,
         "R205": 2834978.65
     }
 
-    print("=" * 80)
-    print("VALIDASI METAHEURISTIK - MT-CVRPTW-PG  | Hybrid GA + 2-Opt")
-    print(f"Dataset        : Solomon Benchmark (10 Dataset | {NUM_CUSTOMERS} pelanggan pertama)")
-    print(f"Parameter GA   : Pop={POP_SIZE}, Gen={MAX_GEN}, Pm={PM}, Elite={ELITISM}, P_2opt={P_2OPT}")
-    print("=" * 80)
+    print("=" * 115)
+    print(f"  VALIDASI METAHEURISTIK: HYBRID GA + 2-OPT | {NUM_CUSTOMERS} PELANGGAN | PARALEL")
+    print(f"  Parameter : Pop={POP_SIZE}, Gen={MAX_GEN}, Pm={PM}, Elite={ELITISM}, P_2opt={P_2OPT}")
+    print(f"  Repetisi  : {N_REPETITIONS}x per Dataset")
+    print(f"  CPU Aktif : {N_WORKERS} core (semua terpakai)")
+    print("=" * 115)
 
-    hasil_all = []
+    hasil_stabilitas = []
 
-    for fpath in DATASET_FILES:
-        name = fpath.split('.')[0]
-        if not os.path.exists(fpath):
-            print(f"[SKIP] {name}: file '{fpath}' tidak ditemukan di folder Anda.")
+    for file_name in DATASET_FILES:
+        name = file_name.replace(".txt", "")
+        if not os.path.exists(file_name):
+            print(f"\n[SKIP] {name}: file '{file_name}' tidak ditemukan.")
             continue
 
-        env = VRPEnvironment(file_path=fpath, num_customers=NUM_CUSTOMERS)
-        if len(env.nodes) == 0:
+        print(f"\n> Memproses Dataset : {file_name}  ({N_REPETITIONS} run paralel) ...")
+
+        args_list = [
+            (file_name, run_ke, NUM_CUSTOMERS, POP_SIZE, MAX_GEN,
+             PM, ELITISM, P_2OPT, VAR_COST)
+            for run_ke in range(1, N_REPETITIONS + 1)
+        ]
+
+        raw_results = {}
+        with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
+            future_to_run = {executor.submit(single_run_worker, args): args[1] for args in args_list}
+            for future in as_completed(future_to_run):
+                try:
+                    run_ke, best_route_chrom, best_details, waktu = future.result()
+                    raw_results[run_ke] = (best_route_chrom, best_details, waktu)
+                except Exception as exc:
+                    run_ke = future_to_run[future]
+                    print(f"   [ERROR] Run {run_ke} gagal: {exc}")
+                    raw_results[run_ke] = (None, None, 0.0)
+
+        list_z      = []
+        list_truk   = []
+        list_waktu  = []
+        count_valid = 0
+        alasan_gabungan = set()
+
+        for run_ke in sorted(raw_results.keys()):
+            best_route_chrom, best_details, waktu_eksekusi = raw_results[run_ke]
+            if best_details is None:
+                print(f"   |- Run {run_ke:2d}: [GAGAL]")
+                continue
+
+            real_z       = best_details[0]
+            armada       = best_details[3]
+            penalty      = best_details[7]
+            alasan_gagal = best_details[9]
+
+            list_z.append(real_z)
+            list_truk.append(armada)
+            list_waktu.append(waktu_eksekusi)
+
+            if penalty == 0:
+                count_valid += 1
+                status_cetak = "VALID"
+            else:
+                status_cetak = f"TDK VALID ({alasan_gagal})"
+                alasan_gabungan.add(alasan_gagal)
+
+            print(f"   |- Run {run_ke:2d}: Z = Rp {real_z:>13,.0f} | "
+                  f"Truk = {armada} | Wkt = {waktu_eksekusi:>6.3f} s | Status: {status_cetak}")
+
+        if len(list_z) == 0:
             continue
 
-        cap = env.vehicle_capacity_dataset
-        FIXED_K = cap * 1000
-        print(f"\n>  {name}  (cap={cap:.0f}  F=Rp{FIXED_K:,.0f}  T_max={env.get_depot().due_date})")
+        best_z_lokal    = min(list_z)
+        avg_z           = float(np.mean(list_z))
+        avg_truk        = float(np.mean(list_truk))
+        avg_waktu       = float(np.mean(list_waktu))
+        rpd_values      = [((z - best_z_lokal) / best_z_lokal) * 100 for z in list_z]
+        arpd_stabilitas = float(np.mean(rpd_values))
+        ringkasan       = "Aman" if count_valid == len(list_z) else " / ".join(list(alasan_gabungan))
 
-        evaluator = RouteEvaluator(env, var_cost=10000)
-        ga_solver = HybridGA(env, evaluator, pop_size=POP_SIZE, max_gen=MAX_GEN, p_m=PM, elitism_rate=ELITISM, p_2opt=P_2OPT)
+        # ARPD vs BKS (validasi terhadap CBC) untuk ditampilkan dalam log
+        bks_lokal = BKS_EXACT.get(name, None)
+        if bks_lokal is not None:
+            arpd_vs_bks = ((best_z_lokal - bks_lokal) / bks_lokal) * 100
+            print(f"   `- Ringkasan : Best Z = Rp {best_z_lokal:,.0f} | "
+                  f"Avg Wkt = {avg_waktu:.3f} s | Valid = {count_valid}/{len(list_z)} | "
+                  f"ARPD vs BKS = {arpd_vs_bks:.2f}%")
+        else:
+            print(f"   `- Ringkasan : Best Z = Rp {best_z_lokal:,.0f} | "
+                  f"Avg Wkt = {avg_waktu:.3f} s | Valid = {count_valid}/{len(list_z)}")
 
-        t0 = time.time()
-        best_route_chrom, best_details = ga_solver.run()
-        solve_time = round(time.time() - t0, 3)
-
-        # Unpack details
-        real_z, penalized_z, fitness, vehicles_used, c1_cost, c2_cost, c3_cost, penalty, routes_record = best_details
-
-        status = "Optimal (Feasible)" if penalty == 0 else "INFEASIBLE"
-
-        Z_str = f"Rp {real_z:>15,.2f}"
-
-        print(f"   Status       : {status}")
-        print(f"   Z            : {Z_str}")
-        print(f"   C1 (tetap)   : Rp {c1_cost:>12,.2f}")
-        print(f"   C2 (jarak)   : Rp {c2_cost:>12,.2f}")
-        print(f"   C3 (kualitas): Rp {c3_cost:>12,.2f}")
-        print(f"   Kendaraan    : {vehicles_used}")
-        print(f"   Waktu GA     : {solve_time} detik")
-        print(f"   Kromosom     : {best_route_chrom}")
-        print("   Rute:")
-        for idx, rt in enumerate(routes_record):
-            print(f"     Trip {idx+1}: {' -> '.join(map(str, rt))}")
-
-        # HITUNG ARPD BERDASARKAN KUNCI JAWABAN SPESIFIK INSTANCE INI
-        bks_lokal = BKS_EXACT.get(name, 1.0)
-        arpd_lokal = round(((real_z - bks_lokal) / bks_lokal) * 100, 2)
-
-        hasil_all.append({
-            "Instance"         : name,
-            "Z_Terbaik (Rp)"   : real_z,
-            "Kendaraan_Dipakai": vehicles_used,
-            "Waktu (s)"        : solve_time,
-            "Status"           : status,
-            "C1_Fixed (Rp)"    : c1_cost,
-            "C2_Transport (Rp)": c2_cost,
-            "C3_Quality (Rp)"  : c3_cost,
-            "ARPD (%)"         : arpd_lokal,
-            "Kromosom"         : str(best_route_chrom)
+        hasil_stabilitas.append({
+            "Instance"              : name,
+            "Best_Z (Rp)"           : best_z_lokal,
+            "Rata2_Biaya_Z (Rp)"    : avg_z,
+            "Rata2_Truk"            : avg_truk,
+            "Rata2_Waktu (s)"       : avg_waktu,
+            "Total_Valid"           : f"{count_valid} / {len(list_z)}",
+            "ARPD (%)"              : arpd_stabilitas,
+            "Alasan_Mayoritas_Gagal": ringkasan
         })
 
-    # ---- TABEL RINGKASAN -----------------------------------
-    print("\n")
-    print("=" * 80)
-    print("TABEL RINGKASAN HASIL VALIDASI METAHEURISTIK (10 DATASET)")
-    print(f"{'Instance':<10} {'Total Biaya Terbaik (Z)':>25} {'Kendaraan':>10} "
-          f"{'Waktu (s)':>12} {'ARPD (%)':>10}")
-    print("-" * 80)
-    for row in hasil_all:
-        z_disp = f"Rp {row['Z_Terbaik (Rp)']:>12,.2f}"
-        arpd_s = f"{row['ARPD (%)']:.2f}%"
-        print(f"{row['Instance']:<10} {z_disp:>25} {row['Kendaraan_Dipakai']:>10} "
-              f"{row['Waktu (s)']:>12.3f} {arpd_s:>10}")
-    print("=" * 80)
+    # ---- TABEL RINGKASAN FINAL ----
+    if hasil_stabilitas:
+        df_stabilitas = pd.DataFrame(hasil_stabilitas)
 
-    # ---- SIMPAN CSV ----------------------------------------
-    df_out = pd.DataFrame(hasil_all)
-    out_csv = "Hasil_Validasi_HybridGA_7Cust.csv"
-    df_out.to_csv(out_csv, index=False)
-    print(f"\n[SAVED] CSV tersimpan di: {out_csv}")
+        df_disp = df_stabilitas.copy()
+        df_disp["Best_Z (Rp)"]        = df_disp["Best_Z (Rp)"].apply(lambda x: f"Rp {x:,.0f}")
+        df_disp["Rata2_Biaya_Z (Rp)"] = df_disp["Rata2_Biaya_Z (Rp)"].apply(lambda x: f"Rp {x:,.0f}")
+        df_disp["Rata2_Truk"]         = df_disp["Rata2_Truk"].apply(lambda x: f"{x:.1f}")
+        df_disp["Rata2_Waktu (s)"]    = df_disp["Rata2_Waktu (s)"].apply(lambda x: f"{x:.2f} s")
+        df_disp["ARPD (%)"]           = df_disp["ARPD (%)"].apply(lambda x: f"{x:.2f} %")
+
+        print("\n" + "=" * 135)
+        print(f"  TABEL RINGKASAN UJI STABILITAS HYBRID GA+2-OPT | {NUM_CUSTOMERS} PELANGGAN | {N_REPETITIONS} REPETISI")
+        print("-" * 135)
+        print(df_disp.to_string(index=False))
+        print("=" * 135)
+
+        nama_file = f"FinalRun_HybridGA_2Opt_{NUM_CUSTOMERS}Cust_{N_REPETITIONS}Rep_Parallel.csv"
+        df_stabilitas.to_csv(nama_file, index=False)
+        print(f"\n[SUKSES] Hasil disimpan ke: '{nama_file}'")
