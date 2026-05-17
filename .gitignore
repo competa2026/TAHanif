@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 *.pyo
 .numba_cache/
+
+# Generated result artifacts (reproducible from scripts)
+FinalRun_*.csv
+Hasil_MILP_*.csv
+Perbandingan_*.csv
