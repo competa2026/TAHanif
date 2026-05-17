@@ -17,19 +17,17 @@ Quality Decay (Pers. 3.1 & 3.2):
 
 Sumber parameter decay: Gopalakrishnan et al. (2016) - ikan kembung:
   alpha_0=0.0321, theta=0.0654, T_arc=0 C, T_node=28 C
-Parameter biaya:
+Parameter biaya (sama dengan ACO/GA referensi):
   F = Q_k x 1.000 Rp, c = Rp 10.000/unit jarak, p = Rp 40.000/kg
 
 Dataset: Solomon Benchmark | 7 pelanggan pertama (+ depot)
 Solver : COIN-OR CBC via PuLP
 
-Catatan metodologis:
-  MILP/CBC bersifat DETERMINISTIK EKSAK -> tidak memerlukan
-  repetisi statistik. N_REPETITIONS=1. Format output disamakan
-  dengan tabel stabilitas meta-heuristik (kolom: Best_Z,
-  Rata2_Biaya_Z, Rata2_Truk, Rata2_Waktu, Total_Valid, ARPD%,
-  Alasan_Mayoritas_Gagal). Untuk N=1, Best_Z == Rata2_Biaya_Z
-  dan ARPD = 0%.
+Optimasi versi ini:
+  Paralelisasi level-dataset via ProcessPoolExecutor. Setiap CPU
+  core menyelesaikan satu instance MILP secara mandiri (CBC 1 thread
+  per proses). Model, kendala, parameter, dan output tabel TIDAK
+  berubah - Z eksak tetap identik.
 ============================================================
 """
 
@@ -38,6 +36,7 @@ import time
 import os
 import pandas as pd
 import pulp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ---------------------------------------------------------
 # BAGIAN 1: PARAMETER GLOBAL
@@ -122,7 +121,8 @@ def solve_milp(
     capacity:     float,
     max_vehicles: int,
     max_trips:    int = 2,
-    time_limit:   int = 90
+    time_limit:   int = 90,
+    cbc_threads:  int = 1
 ) -> dict:
     n  = len(nodes) - 1
     V  = list(range(n + 1))
@@ -271,7 +271,9 @@ def solve_milp(
     for k in K:
         prob += pulp.lpSum(y[(i, k, r)] for i in N_ for r in R) <= n * z[k]
 
-    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit)
+    # Per-proses CBC: 1 thread agar tidak oversubscribe ketika
+    # banyak proses berjalan paralel di ProcessPoolExecutor.
+    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit, threads=cbc_threads)
     t0 = time.time()
     prob.solve(solver)
     solve_time = round(time.time() - t0, 3)
@@ -312,7 +314,25 @@ def solve_milp(
 
 
 # ---------------------------------------------------------
-# BAGIAN 4: EKSEKUSI UTAMA (template format stabilitas)
+# WORKER UNTUK MULTIPROCESSING
+# Setiap worker memuat dataset sendiri, build & solve MILP.
+# ---------------------------------------------------------
+def solve_dataset_worker(args):
+    name, fpath, num_customers, max_trips, max_vehicles, time_limit, cbc_threads = args
+    nodes, cap, max_veh = load_solomon(fpath, num_customers)
+    res = solve_milp(
+        nodes        = nodes,
+        capacity     = cap,
+        max_vehicles = max_vehicles,
+        max_trips    = max_trips,
+        time_limit   = time_limit,
+        cbc_threads  = cbc_threads,
+    )
+    return name, fpath, cap, res
+
+
+# ---------------------------------------------------------
+# BAGIAN 4: EKSEKUSI UTAMA (PARALEL ANTAR-DATASET)
 # ---------------------------------------------------------
 if __name__ == "__main__":
 
@@ -333,112 +353,132 @@ if __name__ == "__main__":
     MAX_TRIPS     = 2
     MAX_VEHICLES  = 4
     TIME_LIMIT    = 90
+    CBC_THREADS   = 1  # 1 thread per CBC karena banyak proses paralel
 
-    # MILP deterministik -> repetisi tidak diperlukan
-    N_REPETITIONS = 1
+    N_WORKERS = os.cpu_count() or 1
 
-    print("=" * 115)
-    print(f"  VALIDASI EKSAK: MILP MT-CVRPTW-PG | {NUM_CUSTOMERS} PELANGGAN | CBC SOLVER")
-    print(f"  Parameter   : Max kendaraan={MAX_VEHICLES}, Max trip/kendaraan={MAX_TRIPS}, TimeLimit={TIME_LIMIT}s")
-    print(f"  alpha_arc   = {ALPHA_ARC:.6f}/mnt  |  alpha_node = {ALPHA_NODE:.6f}/mnt")
-    print(f"  Q_min={Q_MIN*100:.0f}%  p=Rp{FISH_PRICE:,.0f}/kg  c=Rp{VAR_COST:,.0f}/unit jarak")
-    print(f"  Catatan     : MILP deterministik -> 1 run per dataset (tidak perlu repetisi)")
-    print("=" * 115)
+    print("=" * 90)
+    print("VALIDASI MILP - MT-CVRPTW-PG  |  PuLP + CBC Solver  |  PARALEL ANTAR-DATASET")
+    print(f"Dataset       : Solomon Benchmark (10 Dataset | {NUM_CUSTOMERS} pelanggan pertama)")
+    print(f"Max kendaraan : {MAX_VEHICLES}  |  Max trip/kendaraan: {MAX_TRIPS}  |  CBC threads/proses: {CBC_THREADS}")
+    print(f"alpha_arc     = {ALPHA_ARC:.6f}/mnt  |  alpha_node = {ALPHA_NODE:.6f}/mnt")
+    print(f"Q_min={Q_MIN*100:.0f}%  p=Rp{FISH_PRICE:,.0f}/kg  c=Rp{VAR_COST:,.0f}/unit jarak")
+    print(f"Worker        : {N_WORKERS} core (semua CPU terpakai)")
+    print("=" * 90)
 
-    hasil_stabilitas = []
-
+    # Kumpulkan tugas yang valid (file ada)
+    tasks = []
     for name, fpath in DATASET_FILES.items():
         if not os.path.exists(fpath):
-            print(f"\n[SKIP] {name}: file '{fpath}' tidak ditemukan di folder Anda.")
+            print(f"[SKIP] {name}: file '{fpath}' tidak ditemukan di folder Anda.")
             continue
+        tasks.append((name, fpath, NUM_CUSTOMERS, MAX_TRIPS, MAX_VEHICLES, TIME_LIMIT, CBC_THREADS))
 
-        nodes, cap, max_veh = load_solomon(fpath, NUM_CUSTOMERS)
+    if not tasks:
+        print("[ERROR] Tidak ada dataset yang ditemukan. Keluar.")
+        raise SystemExit(1)
+
+    print(f"\n[SYSTEM] Memulai eksekusi {len(tasks)} dataset secara paralel di {N_WORKERS} core. Mohon tunggu...\n")
+
+    raw_results = {}
+    t_global_start = time.time()
+    with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
+        future_to_name = {executor.submit(solve_dataset_worker, t): t[0] for t in tasks}
+        completed = 0
+        for future in as_completed(future_to_name):
+            name_done = future_to_name[future]
+            try:
+                name, fpath, cap, res = future.result()
+            except Exception as exc:
+                print(f"[ERROR] {name_done} gagal: {exc}")
+                raw_results[name_done] = None
+                completed += 1
+                continue
+            raw_results[name] = (fpath, cap, res)
+            completed += 1
+
+            Z_str = f"Rp {res['Z']:>15,.2f}" if res['Z'] != float('inf') else "INFEASIBLE"
+            print(f"[{completed}/{len(tasks)}] Selesai: {name} | "
+                  f"Status = {res['status']:<10} | Z = {Z_str} | "
+                  f"Kendaraan = {res['vehicles']} | Wkt CBC = {res['solve_time']:.2f}s")
+
+    t_global_end = time.time()
+    print(f"\n[SYSTEM] Seluruh pemrosesan paralel selesai dalam {t_global_end - t_global_start:.2f} detik wallclock.")
+
+    # ---- CETAK DETAIL PER DATASET (urut sesuai DATASET_FILES) ----
+    hasil_all = []
+    for name, fpath in DATASET_FILES.items():
+        if name not in raw_results or raw_results[name] is None:
+            continue
+        fpath_, cap, res = raw_results[name]
         FIXED_K = cap * 1_000
-        print(f"\n> Memproses Dataset : {fpath}  (cap={cap:.0f}  F=Rp{FIXED_K:,.0f}  T_max={nodes[0].due_date})")
-
-        res = solve_milp(
-            nodes        = nodes,
-            capacity     = cap,
-            max_vehicles = MAX_VEHICLES,
-            max_trips    = MAX_TRIPS,
-            time_limit   = TIME_LIMIT
-        )
+        nodes_tmp, _, _ = load_solomon(fpath_, NUM_CUSTOMERS)
+        depot_due = nodes_tmp[0].due_date
+        print(f"\n>  {name}  (cap={cap:.0f}  F=Rp{FIXED_K:,.0f}  T_max={depot_due})")
 
         Z_str = f"Rp {res['Z']:>15,.2f}" if res['Z'] != float('inf') else "INFEASIBLE"
-        print(f"   |- Status   : {res['status']}")
-        print(f"   |- Z        : {Z_str}")
-        print(f"   |- C1       : Rp {res['C1']:>12,.2f}")
-        print(f"   |- C2       : Rp {res['C2']:>12,.2f}")
-        print(f"   |- C3       : Rp {res['C3']:>12,.2f}")
-        print(f"   |- Kendaraan: {res['vehicles']}")
-        print(f"   |- Waktu CBC: {res['solve_time']} detik")
+        print(f"   Status       : {res['status']}")
+        print(f"   Z            : {Z_str}")
+        print(f"   C1 (tetap)   : Rp {res['C1']:>12,.2f}")
+        print(f"   C2 (jarak)   : Rp {res['C2']:>12,.2f}")
+        print(f"   C3 (kualitas): Rp {res['C3']:>12,.2f}")
+        print(f"   Kendaraan    : {res['vehicles']}")
+        print(f"   Waktu CBC    : {res['solve_time']} detik")
         if res['routes']:
-            print("   |- Rute     :")
+            print("   Rute:")
             for rt in res['routes']:
-                print(f"      Kendaraan {rt['vehicle']} Trip {rt['trip']}: "
+                print(f"     Kendaraan {rt['vehicle']} Trip {rt['trip']}: "
                       f"{' -> '.join(map(str, rt['route']))}")
 
-        # Tentukan status validitas + alasan untuk kolom Alasan_Mayoritas_Gagal
-        if res['Z'] == float('inf'):
-            valid_count = 0
-            alasan = "INFEASIBLE"
-        elif res['status'] == "Optimal":
-            valid_count = 1
-            alasan = "Aman"
-        else:
-            # Feasible tapi tidak proven optimal (timeout CBC)
-            valid_count = 1
-            alasan = f"Not Proven ({res['status']})"
-
-        # Untuk N=1: Best_Z == Rata2_Biaya_Z, ARPD = 0
-        best_z = res['Z'] if res['Z'] != float('inf') else 0.0
-        avg_z  = best_z
-        arpd   = 0.00  # intra-instance ARPD untuk N=1 selalu 0
-
-        print(f"   `- Ringkasan: Best Z = Rp {best_z:,.0f} | "
-              f"Waktu = {res['solve_time']:.2f} s | Valid = {valid_count}/{N_REPETITIONS} | "
-              f"Status = {alasan}")
-
-        hasil_stabilitas.append({
-            "Instance"              : name,
-            "Best_Z (Rp)"           : best_z,
-            "Rata2_Biaya_Z (Rp)"    : avg_z,
-            "Rata2_Truk"            : float(res['vehicles']),
-            "Rata2_Waktu (s)"       : float(res['solve_time']),
-            "Total_Valid"           : f"{valid_count} / {N_REPETITIONS}",
-            "ARPD (%)"              : arpd,
-            "Alasan_Mayoritas_Gagal": alasan
+        hasil_all.append({
+            "Instance"         : name,
+            "Z_Terbaik (Rp)"   : res["Z"],
+            "Kendaraan_Dipakai": res["vehicles"],
+            "Waktu (s)"        : res["solve_time"],
+            "Status"           : res["status"],
+            "C1_Fixed (Rp)"    : res["C1"],
+            "C2_Transport (Rp)": res["C2"],
+            "C3_Quality (Rp)"  : res["C3"],
         })
 
-    # ---- TABEL RINGKASAN FINAL ----
-    if hasil_stabilitas:
-        df_stabilitas = pd.DataFrame(hasil_stabilitas)
+    # ARPD (Optimality Gap per Instance)
+    for row in hasil_all:
+        if row["Status"] == "Optimal":
+            row["ARPD (%)"] = 0.00
+        elif row["Z_Terbaik (Rp)"] != float('inf'):
+            row["ARPD (%)"] = "Not Proven"
+        else:
+            row["ARPD (%)"] = "N/A"
 
-        df_disp = df_stabilitas.copy()
-        df_disp["Best_Z (Rp)"]        = df_disp["Best_Z (Rp)"].apply(lambda x: f"Rp {x:,.0f}")
-        df_disp["Rata2_Biaya_Z (Rp)"] = df_disp["Rata2_Biaya_Z (Rp)"].apply(lambda x: f"Rp {x:,.0f}")
-        df_disp["Rata2_Truk"]         = df_disp["Rata2_Truk"].apply(lambda x: f"{x:.1f}")
-        df_disp["Rata2_Waktu (s)"]    = df_disp["Rata2_Waktu (s)"].apply(lambda x: f"{x:.2f} s")
-        df_disp["ARPD (%)"]           = df_disp["ARPD (%)"].apply(lambda x: f"{x:.2f} %")
+    # ---- TABEL RINGKASAN ----
+    print("\n")
+    print("=" * 75)
+    print("TABEL RINGKASAN HASIL VALIDASI MILP - MT-CVRPTW-PG (10 DATASET)")
+    print(f"{'Instance':<10} {'Total Biaya Terbaik (Z)':>25} {'Kendaraan':>10} "
+          f"{'Waktu (s)':>12} {'ARPD (%)':>10}")
+    print("-" * 75)
+    for row in hasil_all:
+        z_disp = (f"Rp {row['Z_Terbaik (Rp)']:>12,.2f}"
+                  if row['Z_Terbaik (Rp)'] != float('inf') else "INFEASIBLE")
+        arpd_s = (f"{row['ARPD (%)']:.2f}%"
+                  if isinstance(row['ARPD (%)'], float) else row['ARPD (%)'])
+        print(f"{row['Instance']:<10} {z_disp:>25} {row['Kendaraan_Dipakai']:>10} "
+              f"{row['Waktu (s)']:>12.3f} {arpd_s:>10}")
+    print("=" * 75)
 
-        print("\n" + "=" * 135)
-        print(f"  TABEL RINGKASAN HASIL VALIDASI EKSAK MILP-CBC | {NUM_CUSTOMERS} PELANGGAN | {N_REPETITIONS} RUN")
-        print("-" * 135)
-        print(df_disp.to_string(index=False))
-        print("=" * 135)
+    df_out  = pd.DataFrame(hasil_all)
+    out_csv = "Hasil_MILP_CBC_MT_CVRPTW_PG_10_Dataset.csv"
+    df_out.to_csv(out_csv, index=False)
+    print(f"\n[SAVED] CSV tersimpan di: {out_csv}")
 
-        nama_file = f"FinalRun_MILP_CBC_{NUM_CUSTOMERS}Cust_{N_REPETITIONS}Run.csv"
-        df_stabilitas.to_csv(nama_file, index=False)
-        print(f"\n[SUKSES] Hasil disimpan ke: '{nama_file}'")
-
-        print("\n" + "=" * 115)
-        print("KETERANGAN PARAMETER & METODOLOGI:")
-        print(f"  alpha_0={ALPHA_0}  theta={THETA}  -> Gopalakrishnan et al. (2016)")
-        print(f"  alpha_arc  = alpha({TEMP_ARC}C)/60  = {ALPHA_ARC:.6f} per menit  (dalam kendaraan)")
-        print(f"  alpha_node = alpha({TEMP_NODE}C)/60 = {ALPHA_NODE:.6f} per menit  (bongkar muat)")
-        print(f"  F = Q_k x 1.000 Rp per kendaraan")
-        print(f"  MILP CBC: solver eksak DETERMINISTIK -> 1 run per dataset")
-        print(f"  Best_Z == Rata2_Biaya_Z (N=1)  |  ARPD intra-instance = 0%")
-        print(f"  Status 'Aman' = Optimal proven  |  'Not Proven' = feasible tapi CBC timeout")
-        print(f"  Hasil Z di sini = BKS untuk pembanding ARPD-vs-BKS pada meta-heuristik")
-        print("=" * 115)
+    print("\n" + "=" * 75)
+    print("KETERANGAN PARAMETER MODEL:")
+    print(f"  alpha_0={ALPHA_0}  theta={THETA}  -> Gopalakrishnan et al. (2016)")
+    print(f"  alpha_arc  = alpha({TEMP_ARC}C)/60 = {ALPHA_ARC:.6f} per menit  (dalam kendaraan)")
+    print(f"  alpha_node = alpha({TEMP_NODE}C)/60 = {ALPHA_NODE:.6f} per menit  (bongkar muat)")
+    print(f"  Satuan waktu Solomon = menit (1 unit jarak = 1 menit perjalanan)")
+    print(f"  F = Q_k x 1.000 Rp per kendaraan")
+    print("  ARPD = Optimality gap CBC per instance (0% jika proven optimal)")
+    print(f"  MILP = solver deterministik CBC -> solusi optimal exact (satu run)")
+    print(f"  Wallclock paralel total = {t_global_end - t_global_start:.2f} detik di {N_WORKERS} core")
+    print("=" * 75)
