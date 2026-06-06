@@ -18,6 +18,7 @@ Bitflag pelanggaran dilacak terpisah hanya untuk pelaporan
 """
 
 import math
+import json
 import numpy as np
 import pandas as pd
 import random
@@ -389,6 +390,7 @@ class HybridGA:
         best_details = None
         best_route_chrom = None
         best_penalized_cost = float('inf')
+        best_cost_history = []
 
         for gen in range(self.max_gen):
             pop_fitnesses = []
@@ -399,6 +401,8 @@ class HybridGA:
                     best_penalized_cost = res[1]
                     best_details = res
                     best_route_chrom = chrom.copy()
+
+            best_cost_history.append(best_details[0] if best_details is not None else float('inf'))
 
             sorted_indices = np.argsort(pop_fitnesses)[::-1]
             new_population = []
@@ -436,7 +440,7 @@ class HybridGA:
                 new_population.append(offspring)
             population = new_population
 
-        return best_route_chrom, best_details
+        return best_route_chrom, best_details, best_cost_history
 
 
 # ---------------------------------------------------------
@@ -450,7 +454,7 @@ def single_run_worker(args):
 
     env = VRPEnvironment(file_path=file_name, num_customers=num_customers)
     if len(env.nodes) == 0:
-        return run_ke, None, None, 0.0
+        return run_ke, None, None, 0.0, []
 
     evaluator = RouteEvaluator(env, var_cost=var_cost)
     solver = HybridGA(env, evaluator,
@@ -458,10 +462,10 @@ def single_run_worker(args):
                       p_m=p_m, elitism_rate=elitism, p_2opt=p_2opt)
 
     t_start = time.time()
-    best_route_chrom, best_details = solver.run()
+    best_route_chrom, best_details, best_cost_history = solver.run()
     t_end = time.time()
 
-    return run_ke, best_route_chrom, best_details, round(t_end - t_start, 3)
+    return run_ke, best_route_chrom, best_details, round(t_end - t_start, 3), best_cost_history
 
 
 # ---------------------------------------------------------
@@ -522,12 +526,12 @@ if __name__ == "__main__":
             future_to_run = {executor.submit(single_run_worker, args): args[1] for args in args_list}
             for future in as_completed(future_to_run):
                 try:
-                    run_ke, best_route_chrom, best_details, waktu = future.result()
-                    raw_results[run_ke] = (best_route_chrom, best_details, waktu)
+                    run_ke, best_route_chrom, best_details, waktu, best_cost_history = future.result()
+                    raw_results[run_ke] = (best_route_chrom, best_details, waktu, best_cost_history)
                 except Exception as exc:
                     run_ke = future_to_run[future]
                     print(f"   [ERROR] Run {run_ke} gagal: {exc}")
-                    raw_results[run_ke] = (None, None, 0.0)
+                    raw_results[run_ke] = (None, None, 0.0, [])
 
         list_z      = []
         list_truk   = []
@@ -535,8 +539,11 @@ if __name__ == "__main__":
         count_valid = 0
         alasan_gabungan = set()
 
+        best_run_z = float('inf')
+        best_run_history = None
+
         for run_ke in sorted(raw_results.keys()):
-            best_route_chrom, best_details, waktu_eksekusi = raw_results[run_ke]
+            best_route_chrom, best_details, waktu_eksekusi, best_cost_history = raw_results[run_ke]
             if best_details is None:
                 print(f"   |- Run {run_ke:2d}: [GAGAL]")
                 continue
@@ -549,6 +556,10 @@ if __name__ == "__main__":
             list_z.append(real_z)
             list_truk.append(armada)
             list_waktu.append(waktu_eksekusi)
+
+            if real_z < best_run_z:
+                best_run_z = real_z
+                best_run_history = best_cost_history
 
             if penalty == 0:
                 count_valid += 1
@@ -592,6 +603,24 @@ if __name__ == "__main__":
             "ARPD (%)"              : arpd_stabilitas,
             "Alasan_Mayoritas_Gagal": ringkasan
         })
+
+        # Simpan history konvergensi dari repetisi terbaik untuk verifikasi algoritma
+        if best_run_history is not None:
+            os.makedirs("output_konvergensi", exist_ok=True)
+            history_path = os.path.join(
+                "output_konvergensi",
+                f"history_HybridGA2Opt_{NUM_CUSTOMERS}C_{name}.json"
+            )
+            with open(history_path, 'w') as fh:
+                json.dump({
+                    "instance": name,
+                    "algorithm": "Hybrid_GA2Opt",
+                    "num_customers": NUM_CUSTOMERS,
+                    "max_gen": MAX_GEN,
+                    "best_z": best_z_lokal,
+                    "best_cost_history": [float(z) for z in best_run_history]
+                }, fh, indent=2)
+            print(f"   `- History konvergensi disimpan : '{history_path}'")
 
     # ---- TABEL RINGKASAN FINAL ----
     if hasil_stabilitas:
